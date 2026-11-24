@@ -1,0 +1,182 @@
+# Parallel render on GitHub Actions: each matrix job renders a frame range with the tools/render.mjs method
+# (Playwright + CPU WebGL), encodes it to an mp4 chunk with the finish.sh settings, and a last job joins the chunks
+# and the mix. Run it from the Actions tab ("Run workflow"). Needs mix_final.wav (make the audio first).
+# The repository may hold extracted files, a local .zip, or a .zip uploaded to GitHub Releases.
+# NOTE: GitHub only reads this file from .github/workflows/main.yml (or render.yml) in the repository.
+name: render
+on:
+  workflow_dispatch:
+    inputs:
+      title: { description: "Output file title", default: "short" }
+      chunk: { description: "Frames per job (more jobs = faster, 20 run at once on a Free account)", default: "100" }
+      total: { description: "Frames to render (empty = the whole story; use e.g. 60 for a quick trial run)", default: "" }
+      release_tag: { description: "GitHub Release tag containing the .zip (empty = latest release)", default: "" }
+      zip: { description: "Project zip file name (empty = the first .zip found)", default: "" }
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.p.outputs.matrix }}
+      total: ${{ steps.p.outputs.total }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download & extract project zip (local or from GitHub Releases)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ZIP_INPUT: ${{ inputs.zip }}
+        run: |
+          set -e
+          if [ -f build.mjs ] && [ -d src ]; then echo "project already extracted, nothing to do"; exit 0; fi
+          Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then
+            echo "Downloading project zip from GitHub Releases..."
+            PATTERN="${ZIP_INPUT:-*.zip}"
+            if [ -n "$RELEASE_TAG" ]; then
+              gh release download "$RELEASE_TAG" --pattern "$PATTERN" --clobber
+            else
+              gh release download --pattern "$PATTERN" --clobber
+            fi
+            Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          fi
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then echo "No project .zip found in repo or GitHub Releases."; exit 1; fi
+          echo "extracting $Z"
+          rm -rf _unzipped && mkdir _unzipped
+          unzip -q "$Z" -d _unzipped || python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$Z" _unzipped
+          B=$(find _unzipped -name build.mjs -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | head -n1)
+          if [ -z "$B" ]; then echo "build.mjs not found inside $Z: is this the project zip?"; exit 1; fi
+          cp -a "$(dirname "$B")"/. .
+          rm -rf _unzipped
+          ls
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - id: p
+        run: node ci/plan.mjs "${{ inputs.chunk }}" "${{ inputs.total }}"
+
+  render:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download & extract project zip (local or from GitHub Releases)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ZIP_INPUT: ${{ inputs.zip }}
+        run: |
+          set -e
+          if [ -f build.mjs ] && [ -d src ]; then echo "project already extracted, nothing to do"; exit 0; fi
+          Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then
+            echo "Downloading project zip from GitHub Releases..."
+            PATTERN="${ZIP_INPUT:-*.zip}"
+            if [ -n "$RELEASE_TAG" ]; then
+              gh release download "$RELEASE_TAG" --pattern "$PATTERN" --clobber
+            else
+              gh release download --pattern "$PATTERN" --clobber
+            fi
+            Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          fi
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then echo "No project .zip found in repo or GitHub Releases."; exit 1; fi
+          echo "extracting $Z"
+          rm -rf _unzipped && mkdir _unzipped
+          unzip -q "$Z" -d _unzipped || python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$Z" _unzipped
+          B=$(find _unzipped -name build.mjs -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | head -n1)
+          if [ -z "$B" ]; then echo "build.mjs not found inside $Z: is this the project zip?"; exit 1; fi
+          cp -a "$(dirname "$B")"/. .
+          rm -rf _unzipped
+          ls
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          npm install --no-save playwright
+          npx playwright install --with-deps chromium
+      - run: node build.mjs .
+      - run: node render.mjs frames "${{ matrix.a }}-${{ matrix.b }}"
+      - run: bash ci/encode_chunk.sh ${{ matrix.a }} ${{ matrix.b }} ${{ matrix.i }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.i }}
+          path: chunks/*.mp4
+          retention-days: 1
+          if-no-files-found: error
+
+  stitch:
+    needs: [plan, render]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download & extract project zip (local or from GitHub Releases)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ZIP_INPUT: ${{ inputs.zip }}
+        run: |
+          set -e
+          if [ -f build.mjs ] && [ -d src ]; then echo "project already extracted, nothing to do"; exit 0; fi
+          Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then
+            echo "Downloading project zip from GitHub Releases..."
+            PATTERN="${ZIP_INPUT:-*.zip}"
+            if [ -n "$RELEASE_TAG" ]; then
+              gh release download "$RELEASE_TAG" --pattern "$PATTERN" --clobber
+            else
+              gh release download --pattern "$PATTERN" --clobber
+            fi
+            Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          fi
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then echo "No project .zip found in repo or GitHub Releases."; exit 1; fi
+          echo "extracting $Z"
+          rm -rf _unzipped && mkdir _unzipped
+          unzip -q "$Z" -d _unzipped || python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$Z" _unzipped
+          B=$(find _unzipped -name build.mjs -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | head -n1)
+          if [ -z "$B" ]; then echo "build.mjs not found inside $Z: is this the project zip?"; exit 1; fi
+          cp -a "$(dirname "$B")"/. .
+          rm -rf _unzipped
+          ls
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          path: chunks
+          merge-multiple: true
+      - name: Stitch final video
+        shell: bash
+        env:
+          RAW_TITLE: ${{ inputs.title }}
+          RAW_TOTAL: ${{ needs.plan.outputs.total }}
+        run: |
+          set -e
+          TITLE="$(printf '%s' "$RAW_TITLE" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          [ -n "$TITLE" ] || TITLE="short"
+          TOTAL="$(printf '%s' "$RAW_TOTAL" | tr -dc '0-9')"
+          python3 -c '
+          import re
+          p = "ci/stitch.sh"
+          s = open(p).read()
+          s = s.replace("csv=p=0", "default=noprint_wrappers=1:nokey=1")
+          s = re.sub(
+              r"^(\s*(?:local\s+)?)([A-Za-z_][A-Za-z0-9_]*)=.*ffprobe.*$",
+              lambda m: m.group(0) + "\n" + m.group(1) + m.group(2) + "=$(printf %s \"$" + m.group(2) + "\" | tr -dc 0-9)",
+              s,
+              flags=re.M,
+          )
+          open(p, "w").write(s)
+          '
+          bash ci/stitch.sh "$TITLE" "$TOTAL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: out/*
+          retention-days: 7
