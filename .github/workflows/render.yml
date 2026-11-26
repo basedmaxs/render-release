@@ -13,14 +13,17 @@ on:
       release_tag: { description: "GitHub Release tag containing the .zip (empty = latest release)", default: "" }
       zip: { description: "Project zip file name (empty = the first .zip found)", default: "" }
 
+permissions:
+  contents: read
+
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.p.outputs.matrix }}
       total: ${{ steps.p.outputs.total }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download & extract project zip (local or from GitHub Releases)
         shell: bash
         env:
@@ -50,21 +53,32 @@ jobs:
           cp -a "$(dirname "$B")"/. .
           rm -rf _unzipped
           ls
-      - uses: actions/setup-node@v4
+      - name: Check project files (fail early)
+        shell: bash
+        run: |
+          missing=0
+          for f in build.mjs render.mjs src/story.ts ci/plan.mjs ci/encode_chunk.sh ci/stitch.sh mix_final.wav; do
+            [ -f "$f" ] || { echo "::error::missing file: $f"; missing=1; }
+          done
+          if [ ! -f captions.py ] || [ ! -f work/words.json ]; then
+            echo "::warning::captions.py or work/words.json not found: this video will have NO subtitles"
+          fi
+          exit $missing
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - id: p
         run: node ci/plan.mjs "${{ inputs.chunk }}" "${{ inputs.total }}"
 
   render:
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 180
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download & extract project zip (local or from GitHub Releases)
         shell: bash
         env:
@@ -94,28 +108,41 @@ jobs:
           cp -a "$(dirname "$B")"/. .
           rm -rf _unzipped
           ls
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with: { node-version: 22 }
       - name: Tools
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          npm install --no-save playwright
+          npm install --no-save playwright@1.63.0
           npx playwright install --with-deps chromium
       - run: node build.mjs .
       - run: node render.mjs frames "${{ matrix.a }}-${{ matrix.b }}"
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+      - name: Captions (subtitle)
+        shell: bash
+        run: |
+          set -e
+          if [ ! -f captions.py ] || [ ! -f work/words.json ]; then
+            echo "::warning::captions.py or work/words.json not found: this video will have NO subtitles"
+            exit 0
+          fi
+          pip install -q pillow
+          python3 captions.py work/words.json frames --out frames_cap
+          rm -rf frames && mv frames_cap frames
       - run: bash ci/encode_chunk.sh ${{ matrix.a }} ${{ matrix.b }} ${{ matrix.i }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: chunk-${{ matrix.i }}
           path: chunks/*.mp4
-          retention-days: 1
+          retention-days: 3
           if-no-files-found: error
 
   stitch:
     needs: [plan, render]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Download & extract project zip (local or from GitHub Releases)
         shell: bash
         env:
@@ -146,7 +173,7 @@ jobs:
           rm -rf _unzipped
           ls
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: chunk-*
           path: chunks
@@ -175,7 +202,7 @@ jobs:
           open(p, "w").write(s)
           '
           bash ci/stitch.sh "$TITLE" "$TOTAL"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: final-video
           path: out/*
