@@ -1,0 +1,98 @@
+# Burns subtitles into a video that was ALREADY rendered (no re-render).
+# Takes the "final-video" artifact of an earlier render run, adds captions, keeps the audio as it is.
+name: caption
+on:
+  workflow_dispatch:
+    inputs:
+      run_id: { description: "Run ID of the finished render (empty = newest final-video)", default: "" }
+      release_tag: { description: "GitHub Release tag containing the .zip (empty = latest release)", default: "" }
+      zip: { description: "Project zip file name (empty = the first .zip found)", default: "" }
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  caption:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download & extract project zip (local or from GitHub Releases)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ZIP_INPUT: ${{ inputs.zip }}
+        run: |
+          set -e
+          if [ -f build.mjs ] && [ -d src ]; then echo "project already extracted, nothing to do"; exit 0; fi
+          Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then
+            echo "Downloading project zip from GitHub Releases..."
+            PATTERN="${ZIP_INPUT:-*.zip}"
+            if [ -n "$RELEASE_TAG" ]; then
+              gh release download "$RELEASE_TAG" --pattern "$PATTERN" --clobber
+            else
+              gh release download --pattern "$PATTERN" --clobber
+            fi
+            Z="$ZIP_INPUT"; [ -n "$Z" ] || Z=$(ls -1 *.zip 2>/dev/null | head -n1 || true)
+          fi
+          if [ -z "$Z" ] || [ ! -f "$Z" ]; then echo "No project .zip found in repo or GitHub Releases."; exit 1; fi
+          echo "extracting $Z"
+          rm -rf _unzipped && mkdir _unzipped
+          unzip -q "$Z" -d _unzipped || python3 -c "import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$Z" _unzipped
+          B=$(find _unzipped -name build.mjs -not -path '*/__MACOSX/*' -not -path '*/node_modules/*' | head -n1)
+          if [ -z "$B" ]; then echo "build.mjs not found inside $Z: is this the project zip?"; exit 1; fi
+          cp -a "$(dirname "$B")"/. .
+          rm -rf _unzipped
+          ls
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+      - name: Tools
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q pillow
+      - name: Get the rendered video
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID_INPUT: ${{ inputs.run_id }}
+        run: |
+          set -e
+          RUN_ID="$(printf '%s' "$RUN_ID_INPUT" | tr -dc '0-9')"
+          if [ -z "$RUN_ID" ]; then
+            RUN_ID="$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=final-video&per_page=100" \
+              --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last | .workflow_run.id // empty')"
+          fi
+          [ -n "$RUN_ID" ] || { echo "::error::no final-video artifact found (it may have expired)"; exit 1; }
+          echo "using render run $RUN_ID"
+          rm -rf rendered
+          gh run download "$RUN_ID" --repo "$GITHUB_REPOSITORY" -n final-video -D rendered
+          ls -la rendered
+      - name: Burn subtitles
+        shell: bash
+        run: |
+          set -e
+          for f in captions.py work/words.json src/story.ts; do
+            [ -f "$f" ] || { echo "::error::missing file: $f (is this the right project zip?)"; exit 1; }
+          done
+          V="$(find rendered -name '*.mp4' | sort | head -n1)"
+          [ -n "$V" ] || { echo "::error::no .mp4 inside the final-video artifact"; exit 1; }
+          rm -rf frames frames_cap && mkdir -p frames out
+          ffmpeg -v error -i "$V" -map 0:v:0 -fps_mode passthrough -start_number 0 -qmin 1 -q:v 1 frames/f%04d.jpg
+          N=$(find frames -name 'f*.jpg' | wc -l)
+          EXP=$(grep -oE 'TOTAL *= *[0-9]+' src/story.ts | head -n1 | tr -dc '0-9')
+          echo "video has $N frames, full story has $EXP"
+          [ "$N" = "$EXP" ] || echo "::warning::this video has $N of $EXP frames: it looks like a trial run, not the full video"
+          python3 captions.py work/words.json frames --out frames_cap
+          OUT="out/$(basename "$V" .mp4)-subtitle.mp4"
+          ffmpeg -v error -y -framerate 30 -start_number 0 -i frames_cap/f%04d.jpg -i "$V" -map 0:v:0 -map 1:a:0 \
+            -c:v libx264 -preset slow -crf 17 -pix_fmt yuv420p -c:a copy -movflags +faststart "$OUT"
+          echo "$OUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: final-video-subtitle
+          path: out/*-subtitle.mp4
+          retention-days: 7
+          if-no-files-found: error
